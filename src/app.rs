@@ -6,6 +6,7 @@
 use crate::config::{MapPosition, State};
 use crate::directions::{self, Directions, RouteRequest};
 use crate::domain::place::{OsmId, Poi, PoiDetails, SearchResult};
+use crate::domain::route::WalkingPace;
 use crate::fl;
 use crate::geo::{LatLon, Position};
 use crate::history::{self, StoredPlace};
@@ -35,6 +36,8 @@ const PAN_STEP: f64 = 128.0;
 /// Width of the search field, as in other COSMIC apps.
 const SEARCH_INPUT_WIDTH: f32 = 240.0;
 const SEARCH_RESULTS_WIDTH: f32 = 360.0;
+/// Height of the window until it reports its size.
+const DEFAULT_WINDOW_HEIGHT: f32 = 600.0;
 
 /// The app: the map, with the header search and the context drawer beside it.
 pub struct AppModel {
@@ -51,6 +54,8 @@ pub struct AppModel {
     /// What is remembered between runs, and where, if it can be saved.
     state: State,
     state_handle: Option<cosmic_config::Config>,
+    /// Height of the window, which popovers must fit in.
+    window_height: f32,
     /// Search field in the header bar, shown with its button or Ctrl+F.
     search_id: widget::Id,
     search_active: bool,
@@ -141,6 +146,7 @@ impl cosmic::Application for AppModel {
             key_aliases: key_bind::aliases(),
             state,
             state_handle,
+            window_height: DEFAULT_WINDOW_HEIGHT,
             map,
             search_id: widget::Id::unique(),
             search_active: false,
@@ -162,6 +168,10 @@ impl cosmic::Application for AppModel {
     fn on_app_exit(&mut self) -> Option<Self::Message> {
         self.save_state();
         None
+    }
+
+    fn on_window_resize(&mut self, _id: cosmic::iced::window::Id, _width: f32, height: f32) {
+        self.window_height = height;
     }
 
     /// Closing the window another way, such as from the compositor.
@@ -277,7 +287,11 @@ impl cosmic::Application for AppModel {
                 )
                 .title(fl!("directions"))
                 .actions(back)
-                .header(directions.form_view().map(Message::Directions))
+                .header(
+                    directions
+                        .form_view(self.window_height)
+                        .map(Message::Directions),
+                )
                 .footer(directions::attribution(Message::LaunchUrl))
             }
         })
@@ -427,7 +441,8 @@ impl AppModel {
         let Some(place) = self.map.selected() else {
             return Task::none();
         };
-        let mut directions = Directions::new(place, self.map.user_position());
+        let mut directions =
+            Directions::new(place, self.map.user_position(), self.state.walking_pace);
         let actions = directions.refresh();
         self.directions = Some(directions);
         self.context_page = ContextPage::Directions;
@@ -585,9 +600,22 @@ impl AppModel {
                 }
                 directions::Action::FindRoute(request) => tasks.push(Self::find_route(request)),
                 directions::Action::ShowRoutes { fit } => self.show_routes(fit),
+                directions::Action::SavePace(pace) => self.save_walking_pace(pace),
             }
         }
         Task::batch(tasks)
+    }
+
+    /// Remembers how fast the user walks, saving it at once.
+    fn save_walking_pace(&mut self, pace: WalkingPace) {
+        match &self.state_handle {
+            Some(handle) => {
+                if let Err(err) = self.state.set_walking_pace(handle, pace) {
+                    tracing::warn!("failed to save the walking pace: {err}");
+                }
+            }
+            None => self.state.walking_pace = pace,
+        }
     }
 
     /// Draws the directions' routes on the map, or clears them, framing the
@@ -603,8 +631,14 @@ impl AppModel {
 
     fn find_route(request: RouteRequest) -> Task<cosmic::Action<Message>> {
         cosmic::task::future(async move {
-            let result =
-                transitous::plan(request.from, request.to, request.mode, request.page).await;
+            let result = transitous::plan(
+                request.from,
+                request.to,
+                request.mode,
+                request.options,
+                request.page,
+            )
+            .await;
             Message::Directions(directions::Message::RouteFound(request.id, result))
         })
     }

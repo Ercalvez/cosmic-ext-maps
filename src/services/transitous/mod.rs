@@ -11,7 +11,7 @@ use std::time::Duration;
 
 use self::raw::Response;
 use super::http::{Error, RateLimit, get_json};
-use crate::domain::route::{Plan, RouteMode};
+use crate::domain::route::{Plan, RouteMode, RouteOptions, Timing, WalkingPace};
 use crate::geo::LatLon;
 
 const PLAN_URL: &str = "https://api.transitous.org/api/v6/plan";
@@ -19,15 +19,18 @@ const PLAN_URL: &str = "https://api.transitous.org/api/v6/plan";
 /// per second is plenty.
 static TRANSITOUS: RateLimit = RateLimit::new(Duration::from_secs(1));
 
-/// Routes from `from` to `to`, both latitude and longitude, leaving now, or the
-/// earlier or later page given by a cursor from a previous [`Plan`].
+/// Routes from `from` to `to`, both latitude and longitude, as `options` ask, or
+/// the earlier or later page given by a cursor from a previous [`Plan`] (which
+/// must be asked for with the same options).
 pub async fn plan(
     from: LatLon,
     to: LatLon,
     mode: RouteMode,
+    options: RouteOptions,
     page: Option<String>,
 ) -> Result<Plan, Error> {
-    let response: Response = get_json(&TRANSITOUS, PLAN_URL, &query(from, to, mode, page)).await?;
+    let query = query(from, to, mode, options, page);
+    let response: Response = get_json(&TRANSITOUS, PLAN_URL, &query).await?;
 
     Ok(response.into_plan())
 }
@@ -37,6 +40,7 @@ fn query(
     from: LatLon,
     to: LatLon,
     mode: RouteMode,
+    options: RouteOptions,
     page: Option<String>,
 ) -> Vec<(&'static str, String)> {
     // Without transit modes, only the route all the way by street is computed.
@@ -55,6 +59,23 @@ fn query(
     if mode == RouteMode::Bike {
         // Flatter streets when the detour is small.
         query.push(("elevationCosts", "LOW".to_owned()));
+    }
+    if mode.uses_time() {
+        match options.timing {
+            Timing::Now => {}
+            Timing::DepartAt(time) => query.push(("time", time.to_string())),
+            Timing::ArriveBy(time) => {
+                query.push(("time", time.to_string()));
+                query.push(("arriveBy", "true".to_owned()));
+            }
+        }
+    }
+    // Normal is the service's own assumption: nothing to say.
+    if mode.uses_pace() && options.pace != WalkingPace::Normal {
+        query.push((
+            "pedestrianSpeed",
+            options.pace.meters_per_second().to_string(),
+        ));
     }
     if let Some(page) = page {
         query.push(("pageCursor", page));
@@ -93,7 +114,7 @@ mod tests {
         let louvre = LatLon::new(48.8606, 2.3376);
         let gare_de_lyon = LatLon::new(48.8443, 2.3744);
         let param = |mode, key| {
-            query(louvre, gare_de_lyon, mode, None)
+            query(louvre, gare_de_lyon, mode, RouteOptions::default(), None)
                 .into_iter()
                 .find(|(name, _)| *name == key)
                 .map(|(_, value)| value)
@@ -135,8 +156,127 @@ mod tests {
             louvre,
             gare_de_lyon,
             RouteMode::Transit,
+            RouteOptions::default(),
             Some("LATER|1".to_owned()),
         );
         assert!(page.contains(&("pageCursor", "LATER|1".to_owned())));
+    }
+
+    const LOUVRE: LatLon = LatLon::new(48.8606, 2.3376);
+    const GARE_DE_LYON: LatLon = LatLon::new(48.8443, 2.3744);
+
+    fn names(mode: RouteMode, options: RouteOptions) -> Vec<&'static str> {
+        query(LOUVRE, GARE_DE_LYON, mode, options, None)
+            .into_iter()
+            .map(|(name, _)| name)
+            .collect()
+    }
+
+    fn value(mode: RouteMode, options: RouteOptions, key: &str) -> Option<String> {
+        query(LOUVRE, GARE_DE_LYON, mode, options, None)
+            .into_iter()
+            .find(|(name, _)| *name == key)
+            .map(|(_, value)| value)
+    }
+
+    fn at(time: &str) -> Timing {
+        Timing::DepartAt(time.parse().unwrap())
+    }
+
+    #[test]
+    fn default_options_add_nothing_to_the_request() {
+        for mode in [RouteMode::Walk, RouteMode::Transit] {
+            let names = names(mode, RouteOptions::default());
+            assert!(!names.contains(&"time") && !names.contains(&"pedestrianSpeed"));
+        }
+    }
+
+    #[test]
+    fn transit_can_depart_after_a_time() {
+        let options = RouteOptions {
+            timing: at("2026-11-11T07:30:00Z"),
+            ..RouteOptions::default()
+        };
+        assert_eq!(
+            value(RouteMode::Transit, options, "time").as_deref(),
+            Some("2026-11-11T07:30:00Z")
+        );
+        assert_eq!(value(RouteMode::Transit, options, "arriveBy"), None);
+    }
+
+    #[test]
+    fn transit_can_arrive_by_a_time() {
+        let options = RouteOptions {
+            timing: Timing::ArriveBy("2026-11-11T16:00:00Z".parse().unwrap()),
+            ..RouteOptions::default()
+        };
+        assert_eq!(
+            value(RouteMode::Transit, options, "time").as_deref(),
+            Some("2026-11-11T16:00:00Z")
+        );
+        assert_eq!(
+            value(RouteMode::Transit, options, "arriveBy").as_deref(),
+            Some("true")
+        );
+    }
+
+    #[test]
+    fn only_transit_follows_a_timetable() {
+        let options = RouteOptions {
+            timing: at("2026-11-11T07:30:00Z"),
+            ..RouteOptions::default()
+        };
+        for mode in [RouteMode::Walk, RouteMode::Bike, RouteMode::Car] {
+            assert_eq!(value(mode, options, "time"), None, "{mode:?}");
+        }
+    }
+
+    #[test]
+    fn the_walking_pace_is_a_speed_in_meters_per_second() {
+        let pace = |pace| RouteOptions {
+            pace,
+            ..RouteOptions::default()
+        };
+        assert_eq!(
+            value(RouteMode::Walk, pace(WalkingPace::Fast), "pedestrianSpeed").as_deref(),
+            Some("1.6")
+        );
+        assert_eq!(
+            value(
+                RouteMode::Transit,
+                pace(WalkingPace::Slow),
+                "pedestrianSpeed"
+            )
+            .as_deref(),
+            Some("0.9")
+        );
+        // Cycling and driving do not walk.
+        for mode in [RouteMode::Bike, RouteMode::Car] {
+            assert_eq!(
+                value(mode, pace(WalkingPace::Fast), "pedestrianSpeed"),
+                None
+            );
+        }
+    }
+
+    #[test]
+    fn a_page_is_asked_for_with_the_same_options() {
+        let options = RouteOptions {
+            timing: at("2026-11-11T07:30:00Z"),
+            pace: WalkingPace::Fast,
+        };
+        let page = query(
+            LOUVRE,
+            GARE_DE_LYON,
+            RouteMode::Transit,
+            options,
+            Some("LATER|1".to_owned()),
+        );
+        let names: Vec<_> = page.iter().map(|(name, _)| *name).collect();
+        assert!(
+            ["time", "pedestrianSpeed", "pageCursor"]
+                .iter()
+                .all(|key| names.contains(key))
+        );
     }
 }

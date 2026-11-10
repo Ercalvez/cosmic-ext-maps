@@ -5,6 +5,7 @@
 
 use cosmic::iced::Color;
 use jiff::Timestamp;
+use serde::{Deserialize, Serialize};
 
 use crate::geo::WorldPoint;
 
@@ -15,6 +16,79 @@ pub enum RouteMode {
     Car,
     /// Public transit, with walking to and between stops.
     Transit,
+}
+
+impl RouteMode {
+    /// Whether when to travel matters: only public transit follows a timetable.
+    pub fn uses_time(self) -> bool {
+        self == Self::Transit
+    }
+
+    /// Whether the walking pace matters: on foot, and on the walking legs of a
+    /// transit route.
+    pub fn uses_pace(self) -> bool {
+        matches!(self, Self::Walk | Self::Transit)
+    }
+}
+
+/// When to travel.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub enum Timing {
+    #[default]
+    Now,
+    /// Leave at this time, or after it.
+    DepartAt(Timestamp),
+    /// Arrive at this time, or before it.
+    ArriveBy(Timestamp),
+}
+
+/// How fast the user walks.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum WalkingPace {
+    Slow,
+    #[default]
+    Normal,
+    Fast,
+}
+
+impl WalkingPace {
+    pub const ALL: [Self; 3] = [Self::Slow, Self::Normal, Self::Fast];
+
+    /// The average speed, in meters per second: about 3.2, 4.3 and 5.8 km/h. Normal
+    /// is what the routing service assumes without being told.
+    pub fn meters_per_second(self) -> f64 {
+        match self {
+            Self::Slow => 0.9,
+            Self::Normal => 1.2,
+            Self::Fast => 1.6,
+        }
+    }
+}
+
+/// What the user asks of a route besides where it goes.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct RouteOptions {
+    pub timing: Timing,
+    pub pace: WalkingPace,
+}
+
+impl RouteOptions {
+    /// The options that matter to routes by `mode`, the others left at their
+    /// defaults: two sets that give the same routes are then equal.
+    pub fn for_mode(self, mode: RouteMode) -> Self {
+        Self {
+            timing: if mode.uses_time() {
+                self.timing
+            } else {
+                Timing::Now
+            },
+            pace: if mode.uses_pace() {
+                self.pace
+            } else {
+                WalkingPace::Normal
+            },
+        }
+    }
 }
 
 /// The routes found between two places.
@@ -254,5 +328,55 @@ impl Itinerary {
                 stop.arrival = stop.scheduled_arrival.or(stop.arrival);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn faster_walkers_have_higher_speeds_and_normal_is_the_default() {
+        let [slow, normal, fast] = WalkingPace::ALL.map(WalkingPace::meters_per_second);
+        assert!(slow < normal && normal < fast);
+        assert_eq!(normal, 1.2);
+        assert_eq!(WalkingPace::default(), WalkingPace::Normal);
+    }
+
+    #[test]
+    fn options_that_do_not_apply_to_a_mode_are_dropped() {
+        let options = RouteOptions {
+            timing: Timing::DepartAt("2026-11-11T07:30:00Z".parse().unwrap()),
+            pace: WalkingPace::Fast,
+        };
+        assert_eq!(options.for_mode(RouteMode::Transit), options);
+        assert_eq!(
+            options.for_mode(RouteMode::Walk),
+            RouteOptions {
+                pace: WalkingPace::Fast,
+                ..RouteOptions::default()
+            }
+        );
+        assert_eq!(options.for_mode(RouteMode::Bike), RouteOptions::default());
+    }
+
+    #[test]
+    fn the_pace_survives_being_saved() {
+        for pace in WalkingPace::ALL {
+            let json = serde_json::to_string(&pace).unwrap();
+            assert_eq!(serde_json::from_str::<WalkingPace>(&json).unwrap(), pace);
+        }
+    }
+
+    #[test]
+    fn only_some_modes_use_time_and_pace() {
+        assert!(RouteMode::Transit.uses_time());
+        assert!(
+            ![RouteMode::Walk, RouteMode::Bike, RouteMode::Car]
+                .into_iter()
+                .any(RouteMode::uses_time)
+        );
+        assert!(RouteMode::Walk.uses_pace() && RouteMode::Transit.uses_pace());
+        assert!(!RouteMode::Bike.uses_pace() && !RouteMode::Car.uses_pace());
     }
 }
