@@ -2,6 +2,8 @@
 
 //! Places: what the map shows, what searches find, and what is known about them.
 
+use serde::{Deserialize, Serialize};
+
 use crate::geo::WorldPoint;
 
 #[derive(Debug, Clone)]
@@ -62,7 +64,7 @@ fn readable(value: &str) -> String {
 }
 
 /// The OpenStreetMap object a POI comes from.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum OsmId {
     Node(u64),
     Way(u64),

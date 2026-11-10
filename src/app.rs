@@ -5,9 +5,10 @@
 
 use crate::config::{MapPosition, State};
 use crate::directions::{self, Directions, RouteRequest};
-use crate::domain::place::{OsmId, Poi, PoiDetails};
+use crate::domain::place::{OsmId, Poi, PoiDetails, SearchResult};
 use crate::fl;
 use crate::geo::{LatLon, Position};
+use crate::history::{self, StoredPlace};
 use crate::key_bind::{self, Arrow, MenuAction};
 use crate::map::attribution;
 use crate::map::style::MapPalette;
@@ -72,6 +73,8 @@ pub enum Message {
     Reverse(u64, Result<Option<(Poi, PoiDetails)>, services::Error>),
     SearchActivate,
     SearchClear,
+    /// Forget the places picked from search.
+    SearchClearHistory,
     /// The header search field.
     Search(search_box::Message),
     Place(place_view::Message),
@@ -127,6 +130,8 @@ impl cosmic::Application for AppModel {
             .map(|map| (LatLon::new(map.latitude, map.longitude), map.zoom));
         let palette = MapPalette::from_theme(cosmic::theme::active().cosmic());
         let (map, tiles) = MapView::new(palette, start);
+        let mut search = SearchBox::default();
+        search.set_history(history_results(&state.history));
 
         let mut app = AppModel {
             core,
@@ -139,7 +144,7 @@ impl cosmic::Application for AppModel {
             map,
             search_id: widget::Id::unique(),
             search_active: false,
-            search: SearchBox::default(),
+            search,
             directions: None,
         };
 
@@ -324,11 +329,18 @@ impl cosmic::Application for AppModel {
             Message::Map(event) => self.on_map_event(event),
             Message::SearchActivate => {
                 self.search_active = true;
+                // The places picked before, until something is typed.
+                self.search.show_history();
                 widget::text_input::focus(self.search_id.clone())
             }
             Message::SearchClear => {
                 self.search_active = false;
                 self.search.clear();
+                Task::none()
+            }
+            Message::SearchClearHistory => {
+                self.set_history(Vec::new());
+                self.search.hide_results();
                 Task::none()
             }
             Message::Search(message) => self.on_search(message),
@@ -401,6 +413,7 @@ impl AppModel {
         match self.search.update(message) {
             Some(search_box::Action::Query(query)) => self.search_places(query, Message::Search),
             Some(search_box::Action::Pick(result)) => {
+                self.remember_place(&result);
                 let action = self.map.show_place(result.poi);
                 let route = self.sync_place_drawer();
                 Task::batch([route, Self::run_map_action(action)])
@@ -631,13 +644,52 @@ impl AppModel {
         }
     }
 
-    /// Header search results, shown under the search field.
+    /// Puts a place picked from search first in the history.
+    fn remember_place(&mut self, result: &SearchResult) {
+        let history = history::remember(&self.state.history, StoredPlace::from(result));
+        self.set_history(history);
+    }
+
+    /// Replaces the history, saving it at once so that it survives a crash, and
+    /// lists it in the search field.
+    fn set_history(&mut self, history: Vec<StoredPlace>) {
+        match &self.state_handle {
+            Some(handle) => {
+                if let Err(err) = self.state.set_history(handle, history) {
+                    tracing::warn!("failed to save the search history: {err}");
+                }
+            }
+            None => self.state.history = history,
+        }
+        self.search
+            .set_history(history_results(&self.state.history));
+    }
+
+    /// Header search results, shown under the search field: the places picked
+    /// before, with a way to forget them, or what the search found.
     fn search_results_view(&self) -> Element<'_, Message> {
         let spacing = cosmic::theme::spacing();
 
+        let results = self
+            .search
+            .results_view(|index| Message::Search(search_box::Message::Select(index)));
+        let header = self.search.showing_history().then(|| {
+            widget::row::with_capacity(3)
+                .push(widget::text::caption_heading(fl!("search-recent")))
+                .push(widget::space::horizontal())
+                .push(
+                    widget::button::link(fl!("search-clear-history"))
+                        .padding(0)
+                        .on_press(Message::SearchClearHistory),
+                )
+                .align_y(cosmic::iced::Alignment::Center)
+                .padding([spacing.space_xxs, spacing.space_s])
+        });
+
         widget::container(
-            self.search
-                .results_view(|index| Message::Search(search_box::Message::Select(index))),
+            widget::column::with_capacity(2)
+                .push_maybe(header)
+                .push(results),
         )
         .padding(spacing.space_xxs)
         .width(Length::Fixed(SEARCH_RESULTS_WIDTH))
@@ -674,6 +726,11 @@ impl AppModel {
             Task::none()
         }
     }
+}
+
+/// The places picked from search, as results the search field can list.
+fn history_results(history: &[StoredPlace]) -> Vec<SearchResult> {
+    history.iter().cloned().map(SearchResult::from).collect()
 }
 
 /// The context page to display in the context drawer.

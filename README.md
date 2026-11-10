@@ -25,6 +25,10 @@ A [justfile](./justfile) is included by default for the [casey/just][just] comma
 - **Place search:** [Photon](https://photon.komoot.io), from OpenStreetMap data.
 - **Routes:** [Transitous](https://transitous.org/sources/) for walking, cycling, driving and public transit, credited in the directions panel.
 
+## Privacy
+
+The places you pick from search are remembered on your computer, in COSMIC's state directory, so they can be suggested next time (the latest 20). Nothing is sent anywhere because of it, and the list can be cleared from the search field.
+
 ## Translators
 
 [Fluent][fluent] is used for localization of the software. Fluent's translation files are found in the [i18n directory](./i18n). New translations may copy the [English (en) localization](./i18n/en) of the project, rename `en` to the desired [ISO 639-1 language code][iso-codes], and then translations can be provided for each [message identifier][fluent-guide]. If no translation is necessary, the message may be omitted.
