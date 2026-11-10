@@ -28,7 +28,7 @@ jobs:
       # Build dependencies of libcosmic and the map renderer.
       - run: |
           sudo apt-get update
-          sudo apt-get install -y cmake libxkbcommon-dev libwayland-dev libssl-dev \
+          sudo apt-get install -y cmake protobuf-compiler libxkbcommon-dev libwayland-dev libssl-dev \
             libinput-dev libudev-dev libseat-dev libgbm-dev libdbus-1-dev libfontconfig-dev
       - uses: Swatinem/rust-cache@v2
       - run: cargo clippy --all-targets --all-features --locked -- -D warnings
