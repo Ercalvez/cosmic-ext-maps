@@ -5,8 +5,10 @@
 
 use std::f64::consts::PI;
 
+use serde::{Deserialize, Serialize};
+
 /// Latitude and longitude, in degrees.
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct LatLon {
     pub lat: f64,
     pub lon: f64,

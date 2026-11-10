@@ -6,6 +6,8 @@
 use cosmic::cosmic_config::{self, CosmicConfigEntry, cosmic_config_derive::CosmicConfigEntry};
 use serde::{Deserialize, Serialize};
 
+use crate::history::StoredPlace;
+
 /// Where the map was looking.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct MapPosition {
@@ -19,6 +21,8 @@ pub struct MapPosition {
 pub struct State {
     /// The map's view when the app was last closed.
     pub map: Option<MapPosition>,
+    /// Places picked from search, the latest first.
+    pub history: Vec<StoredPlace>,
 }
 
 impl State {

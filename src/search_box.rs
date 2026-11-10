@@ -16,6 +16,8 @@ use crate::services;
 /// GNOME Maps.
 pub const SEARCH_DELAY: Duration = Duration::from_millis(500);
 const SEARCH_MIN_CHARS: usize = 3;
+/// Most places of the history listed at once, as many as live results.
+const HISTORY_SHOWN: usize = 8;
 
 /// Messages of a search field.
 #[derive(Debug, Clone)]
@@ -66,6 +68,11 @@ pub struct SearchBox {
     pub highlight: Option<usize>,
     /// Enter was pressed before results arrived: pick the first one when they do.
     submitted: bool,
+    /// Places picked before, the latest first. Listed instead of search results
+    /// while the text is too short to search.
+    history: Vec<SearchResult>,
+    /// `results` are places from the history.
+    showing_history: bool,
 }
 
 impl SearchBox {
@@ -109,9 +116,13 @@ impl SearchBox {
         self.input.clone_from(&input);
         self.highlight = None;
         if input.trim().chars().count() < SEARCH_MIN_CHARS {
-            self.hide_results();
+            self.show_history();
             self.submitted = false;
             return None;
+        }
+        // Until the search answers, keep the places of the history that still match.
+        if self.showing_history {
+            self.show_history();
         }
         Some(input)
     }
@@ -122,7 +133,10 @@ impl SearchBox {
     }
 
     fn submit(&mut self) -> Submit {
-        if let Some(index) = self.highlight.or((!self.results.is_empty()).then_some(0)) {
+        // Without a highlight, Enter picks the first live result, but not the first
+        // place of the history: the text typed so far may be what is wanted.
+        let first = (!self.results.is_empty() && !self.showing_history).then_some(0);
+        if let Some(index) = self.highlight.or(first) {
             return Submit::Pick(index);
         }
         if self.input.trim().is_empty() {
@@ -136,6 +150,7 @@ impl SearchBox {
     /// pressed before they arrived.
     fn set_results(&mut self, results: Vec<SearchResult>) -> Option<usize> {
         self.results = results;
+        self.showing_history = false;
         self.highlight = None;
         (std::mem::take(&mut self.submitted) && !self.results.is_empty()).then_some(0)
     }
@@ -156,11 +171,58 @@ impl SearchBox {
 
     pub fn hide_results(&mut self) {
         self.results.clear();
+        self.showing_history = false;
         self.highlight = None;
     }
 
+    /// Empties the field, keeping the history.
     pub fn clear(&mut self) {
-        *self = Self::default();
+        let history = std::mem::take(&mut self.history);
+        *self = Self {
+            history,
+            ..Self::default()
+        };
+    }
+
+    /// Sets the places picked before, the latest first.
+    pub fn set_history(&mut self, history: Vec<SearchResult>) {
+        self.history = history;
+        if self.showing_history {
+            self.show_history();
+        }
+    }
+
+    /// Whether the places listed come from the history rather than a search.
+    pub fn showing_history(&self) -> bool {
+        self.showing_history
+    }
+
+    /// Lists the places of the history that match the text, all of them while it is
+    /// empty, or nothing if none do.
+    pub fn show_history(&mut self) {
+        let text = self.input.trim().to_lowercase();
+        let matches = |result: &SearchResult| {
+            let fields = [
+                Some(&result.poi.name),
+                result.poi.translated_name.as_ref(),
+                result.area.as_ref(),
+            ];
+            text.is_empty()
+                || fields
+                    .into_iter()
+                    .flatten()
+                    .any(|field| field.to_lowercase().contains(&text))
+        };
+
+        self.results = self
+            .history
+            .iter()
+            .filter(|result| matches(result))
+            .take(HISTORY_SHOWN)
+            .cloned()
+            .collect();
+        self.highlight = None;
+        self.showing_history = !self.results.is_empty();
     }
 
     /// Moves the highlight through the results. Returns `false` when none are shown.
@@ -308,5 +370,142 @@ mod tests {
         // The text stays, without the results.
         assert_eq!(search.input, "Châtelet");
         assert!(search.results.is_empty());
+    }
+
+    /// A search box that has been used to pick these places before.
+    fn with_history() -> SearchBox {
+        let mut search = SearchBox::default();
+        search.set_history(vec![
+            result("Gare de Lyon"),
+            result("Musée du Louvre"),
+            result("Hôtel de Ville"),
+        ]);
+        search
+    }
+
+    fn shown(search: &SearchBox) -> Vec<&str> {
+        search
+            .results
+            .iter()
+            .map(|result| result.poi.name.as_str())
+            .collect()
+    }
+
+    #[test]
+    fn the_history_is_listed_when_the_field_opens() {
+        let mut search = with_history();
+        assert!(search.results.is_empty());
+
+        search.show_history();
+        assert!(search.showing_history());
+        assert_eq!(
+            shown(&search),
+            ["Gare de Lyon", "Musée du Louvre", "Hôtel de Ville"]
+        );
+    }
+
+    #[test]
+    fn short_text_filters_the_history_without_searching() {
+        let mut search = with_history();
+        // Case does not matter, and a part of a name is enough.
+        assert_eq!(search.on_input("LO".to_owned()), None);
+        assert_eq!(shown(&search), ["Musée du Louvre"]);
+        assert_eq!(search.on_input("de".to_owned()), None);
+        assert_eq!(shown(&search), ["Gare de Lyon", "Hôtel de Ville"]);
+
+        // Nothing matches: no list at all.
+        assert_eq!(search.on_input("zz".to_owned()), None);
+        assert!(search.results.is_empty() && !search.showing_history());
+        // Emptying the field lists everything again.
+        assert_eq!(search.on_input(String::new()), None);
+        assert_eq!(search.results.len(), 3);
+    }
+
+    #[test]
+    fn matches_also_look_at_the_translated_name_and_the_area() {
+        let mut search = SearchBox::default();
+        let mut louvre = result("Musée du Louvre");
+        louvre.poi.translated_name = Some("Louvre Museum".to_owned());
+        louvre.area = Some("Rue de Rivoli, Paris".to_owned());
+        search.set_history(vec![louvre]);
+
+        search.on_input("mu".to_owned());
+        assert_eq!(search.results.len(), 1);
+        search.on_input("ri".to_owned());
+        assert_eq!(search.results.len(), 1);
+        search.on_input("xy".to_owned());
+        assert!(search.results.is_empty());
+    }
+
+    #[test]
+    fn from_three_characters_the_search_answers_instead() {
+        let mut search = with_history();
+        search.on_input("lo".to_owned());
+
+        // The places that still match stay while the search runs.
+        assert_eq!(search.on_input("lou".to_owned()), Some("lou".to_owned()));
+        assert_eq!(shown(&search), ["Musée du Louvre"]);
+        assert!(search.showing_history());
+
+        // Then the results replace them.
+        search.set_results(vec![result("Louvre - Rivoli")]);
+        assert!(!search.showing_history());
+        assert_eq!(shown(&search), ["Louvre - Rivoli"]);
+    }
+
+    #[test]
+    fn enter_does_not_pick_a_place_of_the_history_unless_highlighted() {
+        let mut search = with_history();
+        search.on_input("lo".to_owned());
+        // The text typed is searched, as when there is no history.
+        assert_eq!(search.submit(), Submit::Search("lo".to_owned()));
+
+        let mut search = with_history();
+        search.show_history();
+        assert_eq!(search.submit(), Submit::Nothing);
+
+        search.move_highlight(true);
+        search.move_highlight(true);
+        assert_eq!(search.submit(), Submit::Pick(1));
+    }
+
+    #[test]
+    fn a_place_of_the_history_is_picked_like_a_result() {
+        let mut search = with_history();
+        search.show_history();
+
+        let picked = search.update(Message::Select(1));
+        assert!(matches!(
+            picked,
+            Some(Action::Pick(result)) if result.poi.name == "Musée du Louvre"
+        ));
+        // The list closes, and the history stays.
+        assert!(search.results.is_empty() && !search.showing_history());
+        search.show_history();
+        assert_eq!(search.results.len(), 3);
+    }
+
+    #[test]
+    fn clearing_the_field_keeps_the_history() {
+        let mut search = with_history();
+        search.on_input("lo".to_owned());
+
+        search.clear();
+        assert!(search.input.is_empty() && search.results.is_empty());
+        search.show_history();
+        assert_eq!(search.results.len(), 3);
+
+        // Clearing the history itself closes the list.
+        search.set_history(Vec::new());
+        assert!(search.results.is_empty() && !search.showing_history());
+    }
+
+    #[test]
+    fn only_the_first_places_are_listed() {
+        let mut search = SearchBox::default();
+        search.set_history((0..20).map(|i| result(&format!("Place {i}"))).collect());
+        search.show_history();
+        assert_eq!(search.results.len(), HISTORY_SHOWN);
+        assert_eq!(search.results[0].poi.name, "Place 0");
     }
 }

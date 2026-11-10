@@ -6,6 +6,7 @@ mod config;
 mod directions;
 mod domain;
 mod geo;
+mod history;
 mod i18n;
 mod key_bind;
 mod map;

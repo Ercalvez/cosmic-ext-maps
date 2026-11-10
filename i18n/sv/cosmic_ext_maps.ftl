@@ -1,4 +1,4 @@
-app-title = Cosmic kartor
+app-title = Kartor
 about = Om
 repository = Källkod
 view = Visa
@@ -8,6 +8,8 @@ show-location = Visa din plats
 git-description = Git commit {$hash} på {$date}
 
 search-placeholder = Sök efter platser
+search-recent = Senaste sökningar
+search-clear-history = Rensa
 
 ## Vägbeskrivning
 

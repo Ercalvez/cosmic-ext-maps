@@ -8,6 +8,8 @@ show-location = Show your location
 git-description = Git commit {$hash} on {$date}
 
 search-placeholder = Search for places
+search-recent = Recent searches
+search-clear-history = Clear
 
 ## Directions
 
