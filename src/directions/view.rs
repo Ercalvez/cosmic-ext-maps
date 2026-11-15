@@ -2,15 +2,23 @@
 
 //! The directions form, and the status or the routes under it.
 
-use cosmic::iced::Length;
+use cosmic::iced::{Alignment, Length};
 use cosmic::prelude::*;
 use cosmic::widget::{self, icon};
+use jiff::civil::Weekday;
 
+use super::options::TimingKind;
 use super::results::{self, Ends};
 use super::{Directions, Field, Message, RouteState, TravelMode};
-use crate::domain::route::RouteMode;
+use crate::domain::route::{RouteMode, WalkingPace};
 use crate::fl;
 use crate::search_box::{self, SearchBox};
+
+/// Height the calendar leaves free in the window: the header bar, the form
+/// above it and some margin.
+const CALENDAR_CHROME: f32 = 300.0;
+/// The least height given to the calendar.
+const CALENDAR_MIN_HEIGHT: f32 = 160.0;
 
 impl TravelMode {
     pub(super) fn label(self) -> String {
@@ -38,8 +46,9 @@ impl TravelMode {
 
 impl Directions {
     /// The form, kept above the scrolling results: modes, start and destination,
-    /// and earlier/later buttons for transit.
-    pub fn form_view(&self) -> Element<'_, Message> {
+    /// the options, and earlier/later buttons for transit. The calendar must fit in
+    /// a window `window_height` high.
+    pub fn form_view(&self, window_height: f32) -> Element<'_, Message> {
         let spacing = cosmic::theme::spacing();
 
         let modes = widget::segmented_control::horizontal(&self.modes).on_activate(Message::Mode);
@@ -71,8 +80,95 @@ impl Directions {
                 fl!("directions-choose-destination"),
                 &self.to_search,
             ))
+            .push_maybe(self.options_view(window_height))
             .push_maybe(self.pages_view())
             .spacing(spacing.space_s)
+            .into()
+    }
+
+    /// What is asked of the route besides its ends: when to travel and how fast to
+    /// walk, as dropdowns. Cycling and driving have none.
+    fn options_view(&self, window_height: f32) -> Option<Element<'_, Message>> {
+        let mode = self.mode().route_mode();
+        let spacing = cosmic::theme::spacing();
+
+        let mut choices = widget::row::with_capacity(2).spacing(spacing.space_xs);
+        if mode.uses_time() {
+            let kind = TimingKind::ALL
+                .iter()
+                .position(|&kind| kind == self.input.kind);
+            choices = choices.push(widget::dropdown(
+                self.labels.kinds.as_slice(),
+                kind,
+                Message::OptionKind,
+            ));
+        }
+        if mode.uses_pace() {
+            let pace = WalkingPace::ALL
+                .iter()
+                .position(|&pace| pace == self.input.pace);
+            choices = choices.push(widget::dropdown(
+                self.labels.paces.as_slice(),
+                pace,
+                Message::OptionPace,
+            ));
+        }
+        if !mode.uses_time() && !mode.uses_pace() {
+            return None;
+        }
+
+        let mut options = widget::column::with_capacity(2).spacing(spacing.space_xs);
+        options = options.push(choices);
+        if mode.uses_time() && self.input.kind != TimingKind::Now {
+            options = options.push(self.time_view(window_height));
+        }
+        Some(options.into())
+    }
+
+    /// The day, in a button that opens the calendar, and the time of day.
+    fn time_view(&self, window_height: f32) -> Element<'_, Message> {
+        let spacing = cosmic::theme::spacing();
+
+        let date = widget::button::standard(self.input.date_label())
+            .leading_icon(icon::from_name("office-calendar-symbolic"))
+            .on_press(Message::ToggleCalendar);
+        let mut day = widget::popover(date);
+        if self.calendar_open {
+            let calendar = widget::calendar(
+                &self.input.calendar,
+                Message::OptionDate,
+                || Message::OptionMonth(false),
+                || Message::OptionMonth(true),
+                Weekday::Monday,
+            );
+            let calendar = widget::container(widget::scrollable(calendar))
+                .padding(spacing.space_s)
+                .max_height((window_height - CALENDAR_CHROME).max(CALENDAR_MIN_HEIGHT))
+                .class(cosmic::theme::Container::Dropdown)
+                .apply(widget::container)
+                // A small gap, so the popover does not touch the button.
+                .padding([spacing.space_xxs, 0, 0, 0]);
+            day = day
+                .popup(calendar)
+                .position(widget::popover::Position::Bottom);
+        }
+
+        widget::row::with_capacity(5)
+            .push(day)
+            .push(widget::space::horizontal())
+            .push(widget::dropdown(
+                self.labels.hours.as_slice(),
+                Some(self.input.hour_index()),
+                Message::OptionHour,
+            ))
+            .push(widget::text::title4(":"))
+            .push(widget::dropdown(
+                self.labels.minutes.as_slice(),
+                Some(self.input.minute_index()),
+                Message::OptionMinute,
+            ))
+            .spacing(spacing.space_xs)
+            .align_y(Alignment::Center)
             .into()
     }
 

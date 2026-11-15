@@ -3,20 +3,26 @@
 //! The directions form: transport mode, start and destination, and the routes
 //! found between them.
 
+mod options;
 mod results;
 mod view;
 
 use std::collections::HashSet;
+use std::time::Duration;
 
-use cosmic::widget::segmented_button;
+use cosmic::widget::segmented_button::{self, SingleSelectModel};
+use jiff::Timestamp;
+use jiff::tz::TimeZone;
 
 use crate::domain::place::Poi;
-use crate::domain::route::{Plan, RouteMode};
+use crate::domain::route::{Plan, RouteMode, RouteOptions, WalkingPace};
 use crate::fl;
 use crate::geo::{LatLon, Position};
 use crate::map::RouteOverlay;
 use crate::search_box::{self, SearchBox};
 use crate::services;
+
+use options::{OptionsInput, TimingKind};
 
 pub use results::attribution;
 
@@ -25,6 +31,22 @@ pub use results::attribution;
 pub enum Message {
     Mode(segmented_button::Entity),
     Swap,
+    /// How the time is given, from its place in [`TimingKind::ALL`].
+    OptionKind(usize),
+    /// Open or close the calendar that picks the day.
+    ToggleCalendar,
+    /// The day chosen in the calendar.
+    OptionDate(jiff::civil::Date),
+    /// Show the next (`true`) or the previous month in the calendar.
+    OptionMonth(bool),
+    /// The hour and the minute, from their places in the dropdowns.
+    OptionHour(usize),
+    OptionMinute(usize),
+    /// The walking pace, from its place in [`WalkingPace::ALL`].
+    OptionPace(usize),
+    /// The options have not changed since the change with this number: search
+    /// again. Answers to earlier changes are stale.
+    OptionsSettled(u64),
     Field(Field, search_box::Message),
     /// Routes found, for the search with this number.
     RouteFound(u64, Result<Plan, services::Error>),
@@ -46,7 +68,15 @@ pub enum Action {
     /// The routes to draw changed: pass [`Directions::route_overlay`] to the map,
     /// framing them when `fit` is set.
     ShowRoutes { fit: bool },
+    /// The walking pace changed, to be remembered for the next time.
+    SavePace(WalkingPace),
+    /// Send [`Message::OptionsSettled`] with this number after [`OPTIONS_DELAY`].
+    OptionsLater(u64),
 }
+
+/// Pause after the options change before routes are searched again, so that
+/// changing several of them is one search, not one per change.
+pub const OPTIONS_DELAY: Duration = Duration::from_millis(500);
 
 /// One of the form's place fields.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -119,6 +149,8 @@ struct RouteQuery {
     from: LatLon,
     to: LatLon,
     mode: RouteMode,
+    /// Only what matters to `mode`.
+    options: RouteOptions,
 }
 
 /// A route search to run with [`transitous::plan`](crate::services::transitous::plan), then pass to
@@ -129,12 +161,15 @@ pub struct RouteRequest {
     pub from: LatLon,
     pub to: LatLon,
     pub mode: RouteMode,
-    /// Earlier or later options, as a cursor from a previous plan.
+    /// Only what matters to `mode`.
+    pub options: RouteOptions,
+    /// Earlier or later options, as a cursor from a previous plan. It is asked for
+    /// with the options of the plan it came from.
     pub page: Option<String>,
 }
 
 pub struct Directions {
-    modes: segmented_button::SingleSelectModel,
+    modes: SingleSelectModel,
     from: Endpoint,
     to: Endpoint,
     /// The user changed the start, so a position arriving must not replace it.
@@ -150,12 +185,43 @@ pub struct Directions {
     chosen: Option<RouteChoice>,
     /// Legs of the chosen option whose stops are listed.
     open_stops: HashSet<usize>,
+    /// When to travel and how fast to walk.
+    options: RouteOptions,
+    /// What the inputs for the options show, which `options` follow.
+    input: OptionsInput,
+    /// The calendar that picks the day is open.
+    calendar_open: bool,
+    /// Number of the latest change to the options, which settles after a pause.
+    options_generation: u64,
+    /// What the dropdowns of the options list, which they borrow while shown.
+    labels: OptionLabels,
+}
+
+/// The texts of the options dropdowns, in the order of their choices.
+#[derive(Debug)]
+struct OptionLabels {
+    kinds: Vec<String>,
+    paces: Vec<String>,
+    hours: Vec<String>,
+    minutes: Vec<String>,
+}
+
+impl OptionLabels {
+    fn new() -> Self {
+        Self {
+            kinds: TimingKind::ALL.iter().map(|kind| kind.label()).collect(),
+            paces: WalkingPace::ALL.iter().map(|pace| pace.label()).collect(),
+            hours: options::hour_labels(),
+            minutes: options::minute_labels(),
+        }
+    }
 }
 
 impl Directions {
-    /// From the user's position, if known, to `destination`.
-    pub fn new(destination: &Poi, user: Option<Position>) -> Self {
-        let mut modes = segmented_button::SingleSelectModel::default();
+    /// From the user's position, if known, to `destination`, leaving now at the
+    /// walking pace given.
+    pub fn new(destination: &Poi, user: Option<Position>, pace: WalkingPace) -> Self {
+        let mut modes = SingleSelectModel::default();
         for mode in TravelMode::ALL {
             let entity = modes
                 .insert()
@@ -166,6 +232,11 @@ impl Directions {
                 entity.activate();
             }
         }
+        let options = RouteOptions {
+            pace,
+            ..RouteOptions::default()
+        };
+        let input = OptionsInput::new(options, &TimeZone::system(), Timestamp::now());
 
         let mut directions = Self {
             modes,
@@ -179,6 +250,11 @@ impl Directions {
             latest_request: 0,
             chosen: None,
             open_stops: HashSet::new(),
+            options,
+            input,
+            calendar_open: false,
+            options_generation: 0,
+            labels: OptionLabels::new(),
         };
         if let Some(position) = user {
             directions.set(Field::From, Endpoint::UserLocation(position));
@@ -191,7 +267,52 @@ impl Directions {
         match message {
             Message::Mode(mode) => {
                 self.modes.activate(mode);
+                self.calendar_open = false;
                 self.refresh()
+            }
+            Message::OptionKind(index) => {
+                let Some(&kind) = TimingKind::ALL.get(index) else {
+                    return Vec::new();
+                };
+                self.input
+                    .set_kind(kind, &TimeZone::system(), Timestamp::now());
+                self.calendar_open = false;
+                self.options_changed()
+            }
+            Message::ToggleCalendar => {
+                self.calendar_open = !self.calendar_open;
+                Vec::new()
+            }
+            Message::OptionDate(date) => {
+                self.input.select_date(date);
+                self.calendar_open = false;
+                self.options_changed()
+            }
+            Message::OptionMonth(next) => {
+                self.input.show_month(next);
+                Vec::new()
+            }
+            Message::OptionHour(index) => {
+                self.input.set_hour(index);
+                self.options_changed()
+            }
+            Message::OptionMinute(index) => {
+                self.input.set_minute(index);
+                self.options_changed()
+            }
+            Message::OptionPace(index) => {
+                let Some(&pace) = WalkingPace::ALL.get(index) else {
+                    return Vec::new();
+                };
+                self.input.pace = pace;
+                self.options_changed()
+            }
+            Message::OptionsSettled(generation) => {
+                if generation == self.options_generation {
+                    self.refresh()
+                } else {
+                    Vec::new()
+                }
             }
             Message::Swap => {
                 self.swap();
@@ -248,6 +369,24 @@ impl Directions {
         // The routes shown may no longer match the form.
         let mut actions = vec![Action::ShowRoutes { fit: false }];
         actions.extend(self.route_request().map(Action::FindRoute));
+        actions
+    }
+
+    /// The inputs changed: the options follow them, and the routes are searched
+    /// again once they stop changing.
+    fn options_changed(&mut self) -> Vec<Action> {
+        let options = self.input.options(&TimeZone::system());
+        if options == self.options {
+            return Vec::new();
+        }
+
+        let mut actions = Vec::new();
+        if options.pace != self.options.pace {
+            actions.push(Action::SavePace(options.pace));
+        }
+        self.options = options;
+        self.options_generation += 1;
+        actions.push(Action::OptionsLater(self.options_generation));
         actions
     }
 
@@ -346,7 +485,13 @@ impl Directions {
             return None;
         };
 
-        let query = RouteQuery { from, to, mode };
+        let options = self.options.for_mode(mode);
+        let query = RouteQuery {
+            from,
+            to,
+            mode,
+            options,
+        };
         if self.query == Some(query) {
             return None;
         }
@@ -437,6 +582,7 @@ impl Directions {
             from: query.from,
             to: query.to,
             mode: query.mode,
+            options: query.options,
             page,
         }
     }
@@ -463,6 +609,7 @@ impl Directions {
 mod tests {
     use super::*;
     use crate::domain::place::SearchResult;
+    use crate::domain::route::Timing;
     use crate::geo::WorldPoint;
 
     fn place(name: &str) -> Poi {
@@ -477,6 +624,182 @@ mod tests {
         }
     }
 
+    /// A form from the user's position to the Hôtel de Ville, searched once in `mode`.
+    fn searched(mode: TravelMode) -> Directions {
+        let mut directions =
+            Directions::new(&place("Hôtel de Ville"), Some(here()), WalkingPace::Normal);
+        select(&mut directions, mode);
+        assert!(directions.route_request().is_some());
+        directions
+    }
+
+    fn find_route(actions: &[Action]) -> Option<&RouteRequest> {
+        actions.iter().find_map(|action| match action {
+            Action::FindRoute(request) => Some(request),
+            _ => None,
+        })
+    }
+
+    fn kind_index(kind: TimingKind) -> usize {
+        TimingKind::ALL.iter().position(|&k| k == kind).unwrap()
+    }
+
+    fn pace_index(pace: WalkingPace) -> usize {
+        WalkingPace::ALL.iter().position(|&p| p == pace).unwrap()
+    }
+
+    fn pace_saved(actions: &[Action], pace: WalkingPace) -> bool {
+        actions
+            .iter()
+            .any(|action| matches!(action, Action::SavePace(saved) if *saved == pace))
+    }
+
+    fn later(actions: &[Action]) -> Option<u64> {
+        actions.iter().find_map(|action| match action {
+            Action::OptionsLater(generation) => Some(*generation),
+            _ => None,
+        })
+    }
+
+    #[test]
+    fn changing_the_options_waits_for_them_to_settle() {
+        let mut directions = searched(TravelMode::Transit);
+        let actions = directions.update(Message::OptionPace(pace_index(WalkingPace::Fast)));
+        assert!(find_route(&actions).is_none());
+        assert!(later(&actions).is_some());
+        assert_eq!(directions.options.pace, WalkingPace::Fast);
+    }
+
+    #[test]
+    fn only_the_last_change_searches() {
+        let mut directions = searched(TravelMode::Transit);
+        let first =
+            later(&directions.update(Message::OptionKind(kind_index(TimingKind::Depart)))).unwrap();
+        let second = later(&directions.update(Message::OptionHour(9))).unwrap();
+        assert_ne!(first, second);
+
+        assert!(directions.update(Message::OptionsSettled(first)).is_empty());
+        let actions = directions.update(Message::OptionsSettled(second));
+        let request = find_route(&actions).expect("one search");
+        assert!(matches!(request.options.timing, Timing::DepartAt(_)));
+    }
+
+    #[test]
+    fn a_new_pace_is_saved_and_searched_with() {
+        let mut directions = searched(TravelMode::Transit);
+        let actions = directions.update(Message::OptionPace(pace_index(WalkingPace::Fast)));
+        assert!(pace_saved(&actions, WalkingPace::Fast));
+
+        let generation = later(&actions).unwrap();
+        let actions = directions.update(Message::OptionsSettled(generation));
+        let request = find_route(&actions).expect("a new search");
+        assert_eq!(request.options.pace, WalkingPace::Fast);
+        assert_eq!(request.mode, RouteMode::Transit);
+    }
+
+    #[test]
+    fn a_time_is_searched_for_and_does_not_save_the_pace() {
+        let mut directions = searched(TravelMode::Transit);
+        directions.update(Message::OptionKind(kind_index(TimingKind::Arrive)));
+        directions.update(Message::OptionDate("2026-11-11".parse().unwrap()));
+        directions.update(Message::OptionHour(17));
+        let actions = directions.update(Message::OptionMinute(0));
+        assert!(!actions.iter().any(|a| matches!(a, Action::SavePace(_))));
+        let expected = directions.input.timing(&TimeZone::system());
+
+        let actions = directions.update(Message::OptionsSettled(later(&actions).unwrap()));
+        let request = find_route(&actions).expect("a new search");
+        assert_eq!(request.options.timing, expected);
+        assert!(matches!(request.options.timing, Timing::ArriveBy(_)));
+    }
+
+    #[test]
+    fn choosing_what_is_already_chosen_changes_nothing() {
+        let mut directions = searched(TravelMode::Transit);
+        let actions = directions.update(Message::OptionPace(pace_index(WalkingPace::Normal)));
+        assert!(actions.is_empty());
+        let actions = directions.update(Message::OptionKind(kind_index(TimingKind::Now)));
+        assert!(actions.is_empty());
+    }
+
+    #[test]
+    fn the_calendar_opens_and_closes_when_a_day_is_chosen() {
+        let mut directions = searched(TravelMode::Transit);
+        directions.update(Message::OptionKind(kind_index(TimingKind::Depart)));
+        directions.update(Message::ToggleCalendar);
+        assert!(directions.calendar_open);
+        // Browsing months changes nothing.
+        assert!(directions.update(Message::OptionMonth(true)).is_empty());
+        assert!(directions.calendar_open);
+
+        let day = "2031-03-04".parse().unwrap();
+        let actions = directions.update(Message::OptionDate(day));
+        assert!(!directions.calendar_open);
+        assert!(later(&actions).is_some());
+    }
+
+    #[test]
+    fn options_that_do_not_apply_to_the_mode_search_nothing() {
+        // On foot, a time means nothing.
+        let mut directions = searched(TravelMode::Foot);
+        let actions = directions.update(Message::OptionKind(kind_index(TimingKind::Depart)));
+        let actions = directions.update(Message::OptionsSettled(later(&actions).unwrap()));
+        assert!(find_route(&actions).is_none());
+
+        // But a pace does.
+        let actions = directions.update(Message::OptionPace(pace_index(WalkingPace::Slow)));
+        let actions = directions.update(Message::OptionsSettled(later(&actions).unwrap()));
+        let request = find_route(&actions).expect("a new search");
+        assert_eq!(request.options.pace, WalkingPace::Slow);
+        assert_eq!(request.options.timing, Timing::Now);
+
+        // Cycling has neither.
+        select(&mut directions, TravelMode::Bike);
+        let request = directions.route_request().unwrap();
+        assert_eq!(request.options, RouteOptions::default());
+    }
+
+    #[test]
+    fn changing_the_mode_closes_the_calendar() {
+        let mut directions = searched(TravelMode::Transit);
+        directions.update(Message::OptionKind(kind_index(TimingKind::Depart)));
+        directions.update(Message::ToggleCalendar);
+        let foot = directions
+            .modes
+            .iter()
+            .find(|&e| directions.modes.data::<TravelMode>(e) == Some(&TravelMode::Foot))
+            .unwrap();
+        directions.update(Message::Mode(foot));
+        assert!(!directions.calendar_open);
+    }
+
+    #[test]
+    fn earlier_and_later_are_asked_for_with_the_options_of_the_plan() {
+        let mut directions = searched(TravelMode::Transit);
+        let actions = directions.update(Message::OptionPace(pace_index(WalkingPace::Fast)));
+        let actions = directions.update(Message::OptionsSettled(later(&actions).unwrap()));
+        let id = find_route(&actions).unwrap().id;
+
+        let plan = Plan {
+            transit: vec![itinerary()],
+            later: Some("LATER|1".to_owned()),
+            ..Plan::default()
+        };
+        directions.insert_route(id, Ok(plan));
+        let page = directions.page_request(true).unwrap();
+        assert_eq!(page.page.as_deref(), Some("LATER|1"));
+        assert_eq!(page.options.pace, WalkingPace::Fast);
+    }
+
+    #[test]
+    fn a_new_form_starts_at_the_saved_pace_and_leaving_now() {
+        let directions = Directions::new(&place("Gare de Lyon"), None, WalkingPace::Slow);
+        assert_eq!(directions.options.pace, WalkingPace::Slow);
+        assert_eq!(directions.options.timing, Timing::Now);
+        assert_eq!(directions.input.pace, WalkingPace::Slow);
+        assert_eq!(directions.input.kind, TimingKind::Now);
+    }
+
     fn select(directions: &mut Directions, mode: TravelMode) {
         let entity = directions
             .modes
@@ -488,26 +811,27 @@ mod tests {
 
     #[test]
     fn defaults_with_and_without_location() {
-        let directions = Directions::new(&place("Hôtel de Ville"), Some(here()));
+        let directions =
+            Directions::new(&place("Hôtel de Ville"), Some(here()), WalkingPace::Normal);
         assert!(matches!(directions.from, Endpoint::UserLocation(_)));
         assert_eq!(directions.from_search.input, fl!("your-location"));
         assert!(matches!(&directions.to, Endpoint::Place(poi) if poi.name == "Hôtel de Ville"));
         assert_eq!(directions.to_search.input, "Hôtel de Ville");
 
-        let directions = Directions::new(&place("Hôtel de Ville"), None);
+        let directions = Directions::new(&place("Hôtel de Ville"), None, WalkingPace::Normal);
         assert!(matches!(directions.from, Endpoint::Unset));
         assert_eq!(directions.from_search.input, "");
     }
 
     #[test]
     fn location_fills_an_untouched_empty_start_only() {
-        let mut directions = Directions::new(&place("Gare de Lyon"), None);
+        let mut directions = Directions::new(&place("Gare de Lyon"), None, WalkingPace::Normal);
         assert!(directions.user_position_known(here()));
         assert!(matches!(directions.from, Endpoint::UserLocation(_)));
         // Later positions update the start without asking for a new search.
         assert!(!directions.user_position_known(here()));
 
-        let mut directions = Directions::new(&place("Gare de Lyon"), None);
+        let mut directions = Directions::new(&place("Gare de Lyon"), None, WalkingPace::Normal);
         let input =
             |text: &str| Message::Field(Field::From, search_box::Message::Input(text.to_owned()));
         directions.update(input("Châtelet"));
@@ -518,7 +842,8 @@ mod tests {
 
     #[test]
     fn swap_exchanges_places_and_texts() {
-        let mut directions = Directions::new(&place("Gare de Lyon"), Some(here()));
+        let mut directions =
+            Directions::new(&place("Gare de Lyon"), Some(here()), WalkingPace::Normal);
         directions.swap();
         assert!(matches!(&directions.from, Endpoint::Place(poi) if poi.name == "Gare de Lyon"));
         assert!(matches!(directions.to, Endpoint::UserLocation(_)));
@@ -528,7 +853,7 @@ mod tests {
 
     #[test]
     fn requests_follow_the_form() {
-        let mut directions = Directions::new(&place("Hôtel de Ville"), None);
+        let mut directions = Directions::new(&place("Hôtel de Ville"), None, WalkingPace::Normal);
         // No start yet.
         assert!(directions.route_request().is_none());
         assert!(matches!(directions.route, RouteState::Idle));
@@ -553,7 +878,8 @@ mod tests {
 
     #[test]
     fn stop_lists_open_and_reset() {
-        let mut directions = Directions::new(&place("Hôtel de Ville"), Some(here()));
+        let mut directions =
+            Directions::new(&place("Hôtel de Ville"), Some(here()), WalkingPace::Normal);
         directions.choose(RouteChoice::Transit(0));
         directions.toggle_stops(1);
         assert!(directions.open_stops.contains(&1));
@@ -580,7 +906,8 @@ mod tests {
 
     #[test]
     fn overlay_highlights_the_chosen_route() {
-        let mut directions = Directions::new(&place("Gare de Lyon"), Some(here()));
+        let mut directions =
+            Directions::new(&place("Gare de Lyon"), Some(here()), WalkingPace::Normal);
         select(&mut directions, TravelMode::Transit);
         let request = directions.route_request().unwrap();
         let plan = Plan {
@@ -609,7 +936,7 @@ mod tests {
 
     #[test]
     fn picking_a_start_searches_routes() {
-        let mut directions = Directions::new(&place("Gare de Lyon"), None);
+        let mut directions = Directions::new(&place("Gare de Lyon"), None, WalkingPace::Normal);
         let field = |message| Message::Field(Field::From, message);
 
         let actions = directions.update(field(search_box::Message::Input("Châtelet".to_owned())));
@@ -639,7 +966,8 @@ mod tests {
 
     #[test]
     fn only_the_latest_answer_frames_the_map() {
-        let mut directions = Directions::new(&place("Hôtel de Ville"), Some(here()));
+        let mut directions =
+            Directions::new(&place("Hôtel de Ville"), Some(here()), WalkingPace::Normal);
         let [_, Action::FindRoute(first)] = &directions.refresh()[..] else {
             panic!()
         };
@@ -664,7 +992,8 @@ mod tests {
 
     #[test]
     fn stale_answers_are_dropped() {
-        let mut directions = Directions::new(&place("Hôtel de Ville"), Some(here()));
+        let mut directions =
+            Directions::new(&place("Hôtel de Ville"), Some(here()), WalkingPace::Normal);
         let first = directions.route_request().unwrap();
         select(&mut directions, TravelMode::Transit);
         let second = directions.route_request().unwrap();

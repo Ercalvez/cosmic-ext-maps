@@ -6,6 +6,7 @@
 use cosmic::cosmic_config::{self, CosmicConfigEntry, cosmic_config_derive::CosmicConfigEntry};
 use serde::{Deserialize, Serialize};
 
+use crate::domain::route::WalkingPace;
 use crate::history::StoredPlace;
 
 /// Where the map was looking.
@@ -23,6 +24,8 @@ pub struct State {
     pub map: Option<MapPosition>,
     /// Places picked from search, the latest first.
     pub history: Vec<StoredPlace>,
+    /// How fast the user walks, for routes on foot and to public transit.
+    pub walking_pace: WalkingPace,
 }
 
 impl State {
