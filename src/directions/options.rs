@@ -1,14 +1,13 @@
 // SPDX-License-Identifier: MPL-2.0
 
-//! The route options popover's state: when to travel and how fast to walk, edited
-//! as a draft until the user applies them.
+//! What the route options inputs show: when to travel and how fast to walk.
 
 use cosmic::widget::calendar::CalendarModel;
 use jiff::civil::Date;
 use jiff::tz::TimeZone;
 use jiff::{Timestamp, ToSpan, Zoned};
 
-use crate::domain::route::{RouteMode, RouteOptions, Timing, WalkingPace};
+use crate::domain::route::{RouteOptions, Timing, WalkingPace};
 use crate::fl;
 
 /// How the time of the trip is given.
@@ -41,10 +40,26 @@ impl WalkingPace {
     }
 }
 
-/// What the popover shows while the user edits: the options as they would be if
-/// applied now.
+/// Minutes are chosen in steps of this many.
+const MINUTE_STEP: i8 = 5;
+
+/// "00" to "23".
+pub fn hour_labels() -> Vec<String> {
+    (0..24).map(|hour| format!("{hour:02}")).collect()
+}
+
+/// "00", "05", up to "55".
+pub fn minute_labels() -> Vec<String> {
+    (0..60)
+        .step_by(usize::from(MINUTE_STEP.unsigned_abs()))
+        .map(|minute| format!("{minute:02}"))
+        .collect()
+}
+
+/// What the inputs show, which the options follow: the time of day is kept even
+/// while it is not used, so that choosing "depart at" again finds it as it was.
 #[derive(Debug, Clone, Copy, PartialEq)]
-pub struct OptionsDraft {
+pub struct OptionsInput {
     pub kind: TimingKind,
     /// The day, and the month the calendar shows.
     pub calendar: CalendarModel,
@@ -54,8 +69,8 @@ pub struct OptionsDraft {
     pub pace: WalkingPace,
 }
 
-impl OptionsDraft {
-    /// A draft of `options`. Without a time, the time of day shown is in a few
+impl OptionsInput {
+    /// The inputs for `options`. Without a time, the time of day shown is in a few
     /// minutes, rounded up to five.
     pub fn new(options: RouteOptions, zone: &TimeZone, now: Timestamp) -> Self {
         let (kind, when) = match options.timing {
@@ -73,7 +88,7 @@ impl OptionsDraft {
     }
 
     /// Chooses how the time is given. Going from "now" to a time shows a time in a
-    /// few minutes, rather than whatever was left in the draft.
+    /// few minutes, rather than whatever was left from before.
     pub fn set_kind(&mut self, kind: TimingKind, zone: &TimeZone, now: Timestamp) {
         if self.kind == TimingKind::Now && kind != TimingKind::Now {
             let when = soon(now, zone);
@@ -97,7 +112,28 @@ impl OptionsDraft {
         }
     }
 
-    /// The time the draft stands for, in `zone`.
+    /// Sets the hour from its place in [`hour_labels`].
+    pub fn set_hour(&mut self, index: usize) {
+        self.hour = i8::try_from(index).unwrap_or(0).clamp(0, 23);
+    }
+
+    /// Sets the minute from its place in [`minute_labels`].
+    pub fn set_minute(&mut self, index: usize) {
+        self.minute = (i8::try_from(index).unwrap_or(0) * MINUTE_STEP).clamp(0, 59);
+    }
+
+    /// The place of the hour in [`hour_labels`].
+    pub fn hour_index(&self) -> usize {
+        usize::try_from(self.hour).unwrap_or(0)
+    }
+
+    /// The place of the minute in [`minute_labels`], a minute between two steps
+    /// showing the step before it.
+    pub fn minute_index(&self) -> usize {
+        usize::try_from(self.minute / MINUTE_STEP).unwrap_or(0)
+    }
+
+    /// The time the inputs stand for, in `zone`.
     pub fn timing(&self, zone: &TimeZone) -> Timing {
         let time = self
             .calendar
@@ -108,7 +144,7 @@ impl OptionsDraft {
         match (self.kind, time) {
             (TimingKind::Depart, Ok(time)) => Timing::DepartAt(time),
             (TimingKind::Arrive, Ok(time)) => Timing::ArriveBy(time),
-            // A time that does not exist, which the calendar and spin buttons cannot
+            // A time that does not exist, which the calendar and dropdowns cannot
             // give, would only be asked for in vain.
             (TimingKind::Now, _) | (_, Err(_)) => Timing::Now,
         }
@@ -120,48 +156,19 @@ impl OptionsDraft {
             pace: self.pace,
         }
     }
+
+    /// The day, as written in the date button.
+    pub fn date_label(&self) -> String {
+        self.calendar.selected.strftime("%Y-%m-%d").to_string()
+    }
 }
 
 /// In about a minute, and on a multiple of five minutes.
 fn soon(now: Timestamp, zone: &TimeZone) -> Zoned {
     let now = now.to_zoned(zone.clone());
     let later = now.checked_add(1.minute()).unwrap_or_else(|_| now.clone());
-    let wait = i64::from((5 - later.minute() % 5) % 5);
+    let wait = i64::from((MINUTE_STEP - later.minute() % MINUTE_STEP) % MINUTE_STEP);
     later.checked_add(wait.minutes()).unwrap_or(later)
-}
-
-/// The options as one line, for the button that opens the popover: only what
-/// applies to `mode`.
-pub fn summary(options: RouteOptions, mode: RouteMode, zone: &TimeZone) -> String {
-    let mut parts = Vec::new();
-
-    if mode.uses_time() {
-        let time = |time: Timestamp| {
-            time.to_zoned(zone.clone())
-                .strftime("%Y-%m-%d %H:%M")
-                .to_string()
-        };
-        parts.push(match options.timing {
-            Timing::Now => fl!("route-leave-now"),
-            Timing::DepartAt(at) => {
-                let time = time(at);
-                fl!("route-summary-depart", time = time)
-            }
-            Timing::ArriveBy(at) => {
-                let time = time(at);
-                fl!("route-summary-arrive", time = time)
-            }
-        });
-    }
-    if mode.uses_pace() {
-        parts.push(match options.pace {
-            WalkingPace::Slow => fl!("route-summary-pace-slow"),
-            WalkingPace::Normal => fl!("route-summary-pace-normal"),
-            WalkingPace::Fast => fl!("route-summary-pace-fast"),
-        });
-    }
-
-    parts.join(" · ")
 }
 
 #[cfg(test)]
@@ -177,121 +184,119 @@ mod tests {
         time.parse().unwrap()
     }
 
-    fn draft(options: RouteOptions) -> OptionsDraft {
-        OptionsDraft::new(options, &paris(), at("2026-11-10T14:32:10Z"))
+    fn input(options: RouteOptions) -> OptionsInput {
+        OptionsInput::new(options, &paris(), at("2026-11-10T14:32:10Z"))
     }
 
     #[test]
-    fn without_a_time_the_draft_shows_the_next_multiple_of_five_minutes() {
+    fn without_a_time_the_inputs_show_the_next_multiple_of_five_minutes() {
         // 14:32:10 UTC is 15:32:10 in Paris: in a minute that is 15:33, then 15:35.
-        let draft = draft(RouteOptions::default());
-        assert_eq!(draft.kind, TimingKind::Now);
-        assert_eq!((draft.hour, draft.minute), (15, 35));
-        assert_eq!(draft.calendar.selected.to_string(), "2026-11-10");
+        let input = input(RouteOptions::default());
+        assert_eq!(input.kind, TimingKind::Now);
+        assert_eq!((input.hour, input.minute), (15, 35));
+        assert_eq!(input.date_label(), "2026-11-10");
 
         // Already on a multiple of five a minute from now.
         let now = at("2026-11-10T14:34:00Z");
-        let draft = OptionsDraft::new(RouteOptions::default(), &paris(), now);
-        assert_eq!((draft.hour, draft.minute), (15, 35));
+        let input = OptionsInput::new(RouteOptions::default(), &paris(), now);
+        assert_eq!((input.hour, input.minute), (15, 35));
     }
 
     #[test]
     fn the_time_wraps_to_the_next_day() {
         let now = at("2026-11-10T22:58:00Z");
-        let draft = OptionsDraft::new(RouteOptions::default(), &paris(), now);
+        let input = OptionsInput::new(RouteOptions::default(), &paris(), now);
         // 23:58 in Paris, so 00:00 on the 11th.
-        assert_eq!((draft.hour, draft.minute), (0, 0));
-        assert_eq!(draft.calendar.selected.to_string(), "2026-11-11");
+        assert_eq!((input.hour, input.minute), (0, 0));
+        assert_eq!(input.date_label(), "2026-11-11");
     }
 
     #[test]
     fn leave_now_asks_for_no_time() {
-        assert_eq!(draft(RouteOptions::default()).timing(&paris()), Timing::Now);
+        assert_eq!(input(RouteOptions::default()).timing(&paris()), Timing::Now);
     }
 
     #[test]
     fn a_local_day_and_time_become_the_right_instant() {
-        let mut draft = draft(RouteOptions::default());
-        draft.set_kind(TimingKind::Depart, &paris(), at("2026-11-10T14:32:10Z"));
-        draft.select_date("2026-11-11".parse().unwrap());
-        draft.hour = 8;
-        draft.minute = 30;
+        let mut input = input(RouteOptions::default());
+        input.set_kind(TimingKind::Depart, &paris(), at("2026-11-10T14:32:10Z"));
+        input.select_date("2026-11-11".parse().unwrap());
+        input.set_hour(8);
+        input.set_minute(6); // The sixth step: 30 minutes.
 
         // 08:30 in Paris is 07:30 UTC.
         assert_eq!(
-            draft.timing(&paris()),
+            input.timing(&paris()),
             Timing::DepartAt(at("2026-11-11T07:30:00Z"))
         );
-        draft.kind = TimingKind::Arrive;
+        input.kind = TimingKind::Arrive;
         assert_eq!(
-            draft.timing(&paris()),
+            input.timing(&paris()),
             Timing::ArriveBy(at("2026-11-11T07:30:00Z"))
         );
     }
 
     #[test]
-    fn a_draft_of_a_time_shows_that_time() {
+    fn inputs_for_a_time_show_that_time() {
         let options = RouteOptions {
             timing: Timing::ArriveBy(at("2026-11-11T16:00:00Z")),
             pace: WalkingPace::Slow,
         };
-        let draft = draft(options);
-        assert_eq!(draft.kind, TimingKind::Arrive);
-        assert_eq!((draft.hour, draft.minute), (17, 0));
-        assert_eq!(draft.pace, WalkingPace::Slow);
-        // And it applies to the same options.
-        assert_eq!(draft.options(&paris()), options);
+        let input = input(options);
+        assert_eq!(input.kind, TimingKind::Arrive);
+        assert_eq!((input.hour, input.minute), (17, 0));
+        assert_eq!(input.pace, WalkingPace::Slow);
+        // And they give back the same options.
+        assert_eq!(input.options(&paris()), options);
     }
 
     #[test]
     fn going_from_now_to_a_time_shows_a_time_in_a_few_minutes() {
-        let mut draft = draft(RouteOptions::default());
-        draft.hour = 3;
-        draft.select_date("2026-12-24".parse().unwrap());
+        let mut input = input(RouteOptions::default());
+        input.set_hour(3);
+        input.select_date("2026-12-24".parse().unwrap());
 
-        draft.set_kind(TimingKind::Arrive, &paris(), at("2026-11-10T14:32:10Z"));
-        assert_eq!((draft.hour, draft.minute), (15, 35));
-        assert_eq!(draft.calendar.selected.to_string(), "2026-11-10");
+        input.set_kind(TimingKind::Arrive, &paris(), at("2026-11-10T14:32:10Z"));
+        assert_eq!((input.hour, input.minute), (15, 35));
+        assert_eq!(input.date_label(), "2026-11-10");
 
         // Between two times, what was chosen stays.
-        draft.hour = 9;
-        draft.set_kind(TimingKind::Depart, &paris(), at("2026-11-10T14:32:10Z"));
-        assert_eq!(draft.hour, 9);
+        input.set_hour(9);
+        input.set_kind(TimingKind::Depart, &paris(), at("2026-11-10T14:32:10Z"));
+        assert_eq!(input.hour, 9);
+    }
+
+    #[test]
+    fn the_dropdowns_list_hours_and_steps_of_five_minutes() {
+        let hours = hour_labels();
+        assert_eq!(
+            (hours.len(), hours[0].as_str(), hours[23].as_str()),
+            (24, "00", "23")
+        );
+        let minutes = minute_labels();
+        assert_eq!(
+            (minutes.len(), minutes[1].as_str(), minutes[11].as_str()),
+            (12, "05", "55")
+        );
+
+        let mut input = input(RouteOptions::default());
+        input.set_hour(17);
+        input.set_minute(11);
+        assert_eq!((input.hour, input.minute), (17, 55));
+        assert_eq!((input.hour_index(), input.minute_index()), (17, 11));
+        // A minute between two steps shows the step before it.
+        input.minute = 47;
+        assert_eq!(input.minute_index(), 9);
     }
 
     #[test]
     fn the_calendar_moves_by_month_without_changing_the_day() {
-        let mut draft = draft(RouteOptions::default());
-        draft.show_month(true);
-        assert_eq!(draft.calendar.visible.to_string(), "2026-12-10");
-        assert_eq!(draft.calendar.selected.to_string(), "2026-11-10");
-        draft.show_month(false);
-        draft.show_month(false);
-        assert_eq!(draft.calendar.visible.to_string(), "2026-10-10");
-    }
-
-    #[test]
-    fn the_summary_only_mentions_what_applies() {
-        let options = RouteOptions {
-            timing: Timing::DepartAt(at("2026-11-11T07:30:00Z")),
-            pace: WalkingPace::Fast,
-        };
-        let pace = fl!("route-summary-pace-fast");
-        let leave = fl!("route-summary-depart", time = "2026-11-11 08:30");
-
-        assert_eq!(
-            summary(options, RouteMode::Transit, &paris()),
-            format!("{leave} · {pace}")
-        );
-        assert_eq!(summary(options, RouteMode::Walk, &paris()), pace);
-        assert_eq!(summary(options, RouteMode::Car, &paris()), "");
-        assert_eq!(
-            summary(RouteOptions::default(), RouteMode::Transit, &paris()),
-            format!(
-                "{} · {}",
-                fl!("route-leave-now"),
-                fl!("route-summary-pace-normal")
-            )
-        );
+        let mut input = input(RouteOptions::default());
+        input.show_month(true);
+        assert_eq!(input.calendar.visible.to_string(), "2026-12-10");
+        assert_eq!(input.date_label(), "2026-11-10");
+        input.show_month(false);
+        input.show_month(false);
+        assert_eq!(input.calendar.visible.to_string(), "2026-10-10");
     }
 }

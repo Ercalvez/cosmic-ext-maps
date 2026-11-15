@@ -8,6 +8,7 @@ mod results;
 mod view;
 
 use std::collections::HashSet;
+use std::time::Duration;
 
 use cosmic::widget::segmented_button::{self, SingleSelectModel};
 use jiff::Timestamp;
@@ -21,7 +22,7 @@ use crate::map::RouteOverlay;
 use crate::search_box::{self, SearchBox};
 use crate::services;
 
-use options::{OptionsDraft, TimingKind};
+use options::{OptionsInput, TimingKind};
 
 pub use results::attribution;
 
@@ -30,20 +31,22 @@ pub use results::attribution;
 pub enum Message {
     Mode(segmented_button::Entity),
     Swap,
-    /// Open or close the route options, dropping what was changed in them.
-    ToggleOptions,
-    /// How the time is given, in the options.
-    TimingKind(segmented_button::Entity),
-    /// The day chosen in the options' calendar.
+    /// How the time is given, from its place in [`TimingKind::ALL`].
+    OptionKind(usize),
+    /// Open or close the calendar that picks the day.
+    ToggleCalendar,
+    /// The day chosen in the calendar.
     OptionDate(jiff::civil::Date),
-    /// Show the next (`true`) or the previous month in the options' calendar.
+    /// Show the next (`true`) or the previous month in the calendar.
     OptionMonth(bool),
-    OptionHour(i8),
-    OptionMinute(i8),
-    /// The walking pace chosen in the options.
-    PaceChosen(segmented_button::Entity),
-    /// Search again with the options as edited.
-    ApplyOptions,
+    /// The hour and the minute, from their places in the dropdowns.
+    OptionHour(usize),
+    OptionMinute(usize),
+    /// The walking pace, from its place in [`WalkingPace::ALL`].
+    OptionPace(usize),
+    /// The options have not changed since the change with this number: search
+    /// again. Answers to earlier changes are stale.
+    OptionsSettled(u64),
     Field(Field, search_box::Message),
     /// Routes found, for the search with this number.
     RouteFound(u64, Result<Plan, services::Error>),
@@ -67,7 +70,13 @@ pub enum Action {
     ShowRoutes { fit: bool },
     /// The walking pace changed, to be remembered for the next time.
     SavePace(WalkingPace),
+    /// Send [`Message::OptionsSettled`] with this number after [`OPTIONS_DELAY`].
+    OptionsLater(u64),
 }
+
+/// Pause after the options change before routes are searched again, so that
+/// changing several of them is one search, not one per change.
+pub const OPTIONS_DELAY: Duration = Duration::from_millis(500);
 
 /// One of the form's place fields.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -176,14 +185,36 @@ pub struct Directions {
     chosen: Option<RouteChoice>,
     /// Legs of the chosen option whose stops are listed.
     open_stops: HashSet<usize>,
-    /// When to travel and how fast to walk, as last applied.
+    /// When to travel and how fast to walk.
     options: RouteOptions,
-    /// The options as being edited in the popover, until applied.
-    draft: OptionsDraft,
-    options_open: bool,
-    /// The choices in the popover, mirroring `draft`.
-    timing_kinds: SingleSelectModel,
-    paces: SingleSelectModel,
+    /// What the inputs for the options show, which `options` follow.
+    input: OptionsInput,
+    /// The calendar that picks the day is open.
+    calendar_open: bool,
+    /// Number of the latest change to the options, which settles after a pause.
+    options_generation: u64,
+    /// What the dropdowns of the options list, which they borrow while shown.
+    labels: OptionLabels,
+}
+
+/// The texts of the options dropdowns, in the order of their choices.
+#[derive(Debug)]
+struct OptionLabels {
+    kinds: Vec<String>,
+    paces: Vec<String>,
+    hours: Vec<String>,
+    minutes: Vec<String>,
+}
+
+impl OptionLabels {
+    fn new() -> Self {
+        Self {
+            kinds: TimingKind::ALL.iter().map(|kind| kind.label()).collect(),
+            paces: WalkingPace::ALL.iter().map(|pace| pace.label()).collect(),
+            hours: options::hour_labels(),
+            minutes: options::minute_labels(),
+        }
+    }
 }
 
 impl Directions {
@@ -205,7 +236,7 @@ impl Directions {
             pace,
             ..RouteOptions::default()
         };
-        let draft = OptionsDraft::new(options, &TimeZone::system(), Timestamp::now());
+        let input = OptionsInput::new(options, &TimeZone::system(), Timestamp::now());
 
         let mut directions = Self {
             modes,
@@ -220,12 +251,11 @@ impl Directions {
             chosen: None,
             open_stops: HashSet::new(),
             options,
-            draft,
-            options_open: false,
-            timing_kinds: choices(TimingKind::ALL.map(|kind| (kind.label(), kind))),
-            paces: choices(WalkingPace::ALL.map(|pace| (pace.label(), pace))),
+            input,
+            calendar_open: false,
+            options_generation: 0,
+            labels: OptionLabels::new(),
         };
-        directions.sync_choices();
         if let Some(position) = user {
             directions.set(Field::From, Endpoint::UserLocation(position));
         }
@@ -237,46 +267,53 @@ impl Directions {
         match message {
             Message::Mode(mode) => {
                 self.modes.activate(mode);
-                // What the options show depends on the mode.
-                self.options_open = false;
+                self.calendar_open = false;
                 self.refresh()
             }
-            Message::ToggleOptions => {
-                self.toggle_options();
-                Vec::new()
+            Message::OptionKind(index) => {
+                let Some(&kind) = TimingKind::ALL.get(index) else {
+                    return Vec::new();
+                };
+                self.input
+                    .set_kind(kind, &TimeZone::system(), Timestamp::now());
+                self.calendar_open = false;
+                self.options_changed()
             }
-            Message::TimingKind(entity) => {
-                if let Some(&kind) = self.timing_kinds.data::<TimingKind>(entity) {
-                    self.draft
-                        .set_kind(kind, &TimeZone::system(), Timestamp::now());
-                    self.sync_choices();
-                }
+            Message::ToggleCalendar => {
+                self.calendar_open = !self.calendar_open;
                 Vec::new()
             }
             Message::OptionDate(date) => {
-                self.draft.select_date(date);
-                Vec::new()
+                self.input.select_date(date);
+                self.calendar_open = false;
+                self.options_changed()
             }
             Message::OptionMonth(next) => {
-                self.draft.show_month(next);
+                self.input.show_month(next);
                 Vec::new()
             }
-            Message::OptionHour(hour) => {
-                self.draft.hour = hour;
-                Vec::new()
+            Message::OptionHour(index) => {
+                self.input.set_hour(index);
+                self.options_changed()
             }
-            Message::OptionMinute(minute) => {
-                self.draft.minute = minute;
-                Vec::new()
+            Message::OptionMinute(index) => {
+                self.input.set_minute(index);
+                self.options_changed()
             }
-            Message::PaceChosen(entity) => {
-                if let Some(&pace) = self.paces.data::<WalkingPace>(entity) {
-                    self.draft.pace = pace;
-                    self.sync_choices();
+            Message::OptionPace(index) => {
+                let Some(&pace) = WalkingPace::ALL.get(index) else {
+                    return Vec::new();
+                };
+                self.input.pace = pace;
+                self.options_changed()
+            }
+            Message::OptionsSettled(generation) => {
+                if generation == self.options_generation {
+                    self.refresh()
+                } else {
+                    Vec::new()
                 }
-                Vec::new()
             }
-            Message::ApplyOptions => self.apply_options(),
             Message::Swap => {
                 self.swap();
                 self.refresh()
@@ -335,32 +372,21 @@ impl Directions {
         actions
     }
 
-    /// Opens the options with the ones applied, or closes them, dropping any change.
-    fn toggle_options(&mut self) {
-        self.options_open = !self.options_open;
-        if self.options_open {
-            self.draft = OptionsDraft::new(self.options, &TimeZone::system(), Timestamp::now());
-            self.sync_choices();
+    /// The inputs changed: the options follow them, and the routes are searched
+    /// again once they stop changing.
+    fn options_changed(&mut self) -> Vec<Action> {
+        let options = self.input.options(&TimeZone::system());
+        if options == self.options {
+            return Vec::new();
         }
-    }
-
-    /// Makes the popover's choices show the draft.
-    fn sync_choices(&mut self) {
-        activate(&mut self.timing_kinds, &self.draft.kind);
-        activate(&mut self.paces, &self.draft.pace);
-    }
-
-    /// Applies the options as edited: one search, or none if they changed nothing.
-    fn apply_options(&mut self) -> Vec<Action> {
-        let options = self.draft.options(&TimeZone::system());
-        self.options_open = false;
 
         let mut actions = Vec::new();
         if options.pace != self.options.pace {
             actions.push(Action::SavePace(options.pace));
         }
         self.options = options;
-        actions.extend(self.refresh());
+        self.options_generation += 1;
+        actions.push(Action::OptionsLater(self.options_generation));
         actions
     }
 
@@ -579,25 +605,6 @@ impl Directions {
     }
 }
 
-/// A set of choices, in the order given, each carrying its value.
-fn choices<T: Copy + 'static, const N: usize>(items: [(String, T); N]) -> SingleSelectModel {
-    let mut model = SingleSelectModel::default();
-    for (label, value) in items {
-        model.insert().text(label).data(value);
-    }
-    model
-}
-
-/// Selects the choice that carries `value`.
-fn activate<T: PartialEq + 'static>(model: &mut SingleSelectModel, value: &T) {
-    let entity = model
-        .iter()
-        .find(|&entity| model.data::<T>(entity) == Some(value));
-    if let Some(entity) = entity {
-        model.activate(entity);
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -617,17 +624,6 @@ mod tests {
         }
     }
 
-    /// The choice of a popover that carries `value`.
-    fn choice<T: PartialEq + 'static>(
-        model: &SingleSelectModel,
-        value: &T,
-    ) -> segmented_button::Entity {
-        model
-            .iter()
-            .find(|&entity| model.data::<T>(entity) == Some(value))
-            .unwrap()
-    }
-
     /// A form from the user's position to the Hôtel de Ville, searched once in `mode`.
     fn searched(mode: TravelMode) -> Directions {
         let mut directions =
@@ -644,95 +640,115 @@ mod tests {
         })
     }
 
-    #[test]
-    fn editing_the_options_starts_no_search_until_they_are_applied() {
-        let mut directions = searched(TravelMode::Transit);
-        directions.update(Message::ToggleOptions);
-        assert!(directions.options_open);
+    fn kind_index(kind: TimingKind) -> usize {
+        TimingKind::ALL.iter().position(|&k| k == kind).unwrap()
+    }
 
-        let fast = choice(&directions.paces, &WalkingPace::Fast);
-        let depart = choice(&directions.timing_kinds, &TimingKind::Depart);
-        for message in [
-            Message::PaceChosen(fast),
-            Message::TimingKind(depart),
-            Message::OptionHour(9),
-            Message::OptionMinute(30),
-            Message::OptionMonth(true),
-        ] {
-            let actions = directions.update(message);
-            assert!(find_route(&actions).is_none() && actions.is_empty());
-        }
-        // Nothing is asked of the routes yet.
-        assert!(find_route(&directions.refresh()).is_none());
-        assert_eq!(directions.options, RouteOptions::default());
+    fn pace_index(pace: WalkingPace) -> usize {
+        WalkingPace::ALL.iter().position(|&p| p == pace).unwrap()
+    }
+
+    fn pace_saved(actions: &[Action], pace: WalkingPace) -> bool {
+        actions
+            .iter()
+            .any(|action| matches!(action, Action::SavePace(saved) if *saved == pace))
+    }
+
+    fn later(actions: &[Action]) -> Option<u64> {
+        actions.iter().find_map(|action| match action {
+            Action::OptionsLater(generation) => Some(*generation),
+            _ => None,
+        })
     }
 
     #[test]
-    fn applying_a_pace_searches_again_and_saves_it() {
+    fn changing_the_options_waits_for_them_to_settle() {
         let mut directions = searched(TravelMode::Transit);
-        directions.update(Message::ToggleOptions);
-        let fast = choice(&directions.paces, &WalkingPace::Fast);
-        directions.update(Message::PaceChosen(fast));
+        let actions = directions.update(Message::OptionPace(pace_index(WalkingPace::Fast)));
+        assert!(find_route(&actions).is_none());
+        assert!(later(&actions).is_some());
+        assert_eq!(directions.options.pace, WalkingPace::Fast);
+    }
 
-        let actions = directions.update(Message::ApplyOptions);
-        assert!(!directions.options_open);
-        assert!(
-            actions
-                .iter()
-                .any(|action| matches!(action, Action::SavePace(WalkingPace::Fast)))
-        );
+    #[test]
+    fn only_the_last_change_searches() {
+        let mut directions = searched(TravelMode::Transit);
+        let first =
+            later(&directions.update(Message::OptionKind(kind_index(TimingKind::Depart)))).unwrap();
+        let second = later(&directions.update(Message::OptionHour(9))).unwrap();
+        assert_ne!(first, second);
+
+        assert!(directions.update(Message::OptionsSettled(first)).is_empty());
+        let actions = directions.update(Message::OptionsSettled(second));
+        let request = find_route(&actions).expect("one search");
+        assert!(matches!(request.options.timing, Timing::DepartAt(_)));
+    }
+
+    #[test]
+    fn a_new_pace_is_saved_and_searched_with() {
+        let mut directions = searched(TravelMode::Transit);
+        let actions = directions.update(Message::OptionPace(pace_index(WalkingPace::Fast)));
+        assert!(pace_saved(&actions, WalkingPace::Fast));
+
+        let generation = later(&actions).unwrap();
+        let actions = directions.update(Message::OptionsSettled(generation));
         let request = find_route(&actions).expect("a new search");
         assert_eq!(request.options.pace, WalkingPace::Fast);
         assert_eq!(request.mode, RouteMode::Transit);
     }
 
     #[test]
-    fn applying_a_time_searches_for_it() {
+    fn a_time_is_searched_for_and_does_not_save_the_pace() {
         let mut directions = searched(TravelMode::Transit);
-        directions.update(Message::ToggleOptions);
-        let arrive = choice(&directions.timing_kinds, &TimingKind::Arrive);
-        directions.update(Message::TimingKind(arrive));
+        directions.update(Message::OptionKind(kind_index(TimingKind::Arrive)));
         directions.update(Message::OptionDate("2026-11-11".parse().unwrap()));
         directions.update(Message::OptionHour(17));
-        directions.update(Message::OptionMinute(0));
-        let expected = directions.draft.timing(&TimeZone::system());
+        let actions = directions.update(Message::OptionMinute(0));
+        assert!(!actions.iter().any(|a| matches!(a, Action::SavePace(_))));
+        let expected = directions.input.timing(&TimeZone::system());
 
-        let actions = directions.update(Message::ApplyOptions);
+        let actions = directions.update(Message::OptionsSettled(later(&actions).unwrap()));
         let request = find_route(&actions).expect("a new search");
         assert_eq!(request.options.timing, expected);
         assert!(matches!(request.options.timing, Timing::ArriveBy(_)));
-        // The pace did not change: nothing to save.
-        assert!(
-            !actions
-                .iter()
-                .any(|action| matches!(action, Action::SavePace(_)))
-        );
     }
 
     #[test]
-    fn applying_nothing_new_searches_nothing() {
+    fn choosing_what_is_already_chosen_changes_nothing() {
         let mut directions = searched(TravelMode::Transit);
-        directions.update(Message::ToggleOptions);
-        let actions = directions.update(Message::ApplyOptions);
-        assert!(find_route(&actions).is_none());
-        assert!(!directions.options_open);
+        let actions = directions.update(Message::OptionPace(pace_index(WalkingPace::Normal)));
+        assert!(actions.is_empty());
+        let actions = directions.update(Message::OptionKind(kind_index(TimingKind::Now)));
+        assert!(actions.is_empty());
+    }
+
+    #[test]
+    fn the_calendar_opens_and_closes_when_a_day_is_chosen() {
+        let mut directions = searched(TravelMode::Transit);
+        directions.update(Message::OptionKind(kind_index(TimingKind::Depart)));
+        directions.update(Message::ToggleCalendar);
+        assert!(directions.calendar_open);
+        // Browsing months changes nothing.
+        assert!(directions.update(Message::OptionMonth(true)).is_empty());
+        assert!(directions.calendar_open);
+
+        let day = "2031-03-04".parse().unwrap();
+        let actions = directions.update(Message::OptionDate(day));
+        assert!(!directions.calendar_open);
+        assert!(later(&actions).is_some());
     }
 
     #[test]
     fn options_that_do_not_apply_to_the_mode_search_nothing() {
         // On foot, a time means nothing.
         let mut directions = searched(TravelMode::Foot);
-        directions.update(Message::ToggleOptions);
-        let depart = choice(&directions.timing_kinds, &TimingKind::Depart);
-        directions.update(Message::TimingKind(depart));
-        let actions = directions.update(Message::ApplyOptions);
+        let actions = directions.update(Message::OptionKind(kind_index(TimingKind::Depart)));
+        let actions = directions.update(Message::OptionsSettled(later(&actions).unwrap()));
         assert!(find_route(&actions).is_none());
 
         // But a pace does.
-        directions.update(Message::ToggleOptions);
-        let slow = choice(&directions.paces, &WalkingPace::Slow);
-        directions.update(Message::PaceChosen(slow));
-        let actions = directions.update(Message::ApplyOptions);
+        let actions = directions.update(Message::OptionPace(pace_index(WalkingPace::Slow)));
+        let actions = directions.update(Message::OptionsSettled(later(&actions).unwrap()));
         let request = find_route(&actions).expect("a new search");
         assert_eq!(request.options.pace, WalkingPace::Slow);
         assert_eq!(request.options.timing, Timing::Now);
@@ -744,36 +760,24 @@ mod tests {
     }
 
     #[test]
-    fn closing_the_options_drops_what_was_edited() {
+    fn changing_the_mode_closes_the_calendar() {
         let mut directions = searched(TravelMode::Transit);
-        directions.update(Message::ToggleOptions);
-        let fast = choice(&directions.paces, &WalkingPace::Fast);
-        directions.update(Message::PaceChosen(fast));
-        directions.update(Message::ToggleOptions);
-        assert!(!directions.options_open);
-
-        directions.update(Message::ToggleOptions);
-        assert_eq!(directions.draft.pace, WalkingPace::Normal);
-        let normal = choice(&directions.paces, &WalkingPace::Normal);
-        assert_eq!(directions.paces.active(), normal);
-    }
-
-    #[test]
-    fn changing_the_mode_closes_the_options() {
-        let mut directions = searched(TravelMode::Transit);
-        directions.update(Message::ToggleOptions);
-        let foot = choice(&directions.modes, &TravelMode::Foot);
+        directions.update(Message::OptionKind(kind_index(TimingKind::Depart)));
+        directions.update(Message::ToggleCalendar);
+        let foot = directions
+            .modes
+            .iter()
+            .find(|&e| directions.modes.data::<TravelMode>(e) == Some(&TravelMode::Foot))
+            .unwrap();
         directions.update(Message::Mode(foot));
-        assert!(!directions.options_open);
+        assert!(!directions.calendar_open);
     }
 
     #[test]
     fn earlier_and_later_are_asked_for_with_the_options_of_the_plan() {
         let mut directions = searched(TravelMode::Transit);
-        directions.update(Message::ToggleOptions);
-        let fast = choice(&directions.paces, &WalkingPace::Fast);
-        directions.update(Message::PaceChosen(fast));
-        let actions = directions.update(Message::ApplyOptions);
+        let actions = directions.update(Message::OptionPace(pace_index(WalkingPace::Fast)));
+        let actions = directions.update(Message::OptionsSettled(later(&actions).unwrap()));
         let id = find_route(&actions).unwrap().id;
 
         let plan = Plan {
@@ -792,9 +796,8 @@ mod tests {
         let directions = Directions::new(&place("Gare de Lyon"), None, WalkingPace::Slow);
         assert_eq!(directions.options.pace, WalkingPace::Slow);
         assert_eq!(directions.options.timing, Timing::Now);
-        assert_eq!(directions.draft.pace, WalkingPace::Slow);
-        let slow = choice(&directions.paces, &WalkingPace::Slow);
-        assert_eq!(directions.paces.active(), slow);
+        assert_eq!(directions.input.pace, WalkingPace::Slow);
+        assert_eq!(directions.input.kind, TimingKind::Now);
     }
 
     fn select(directions: &mut Directions, mode: TravelMode) {

@@ -601,6 +601,12 @@ impl AppModel {
                 directions::Action::FindRoute(request) => tasks.push(Self::find_route(request)),
                 directions::Action::ShowRoutes { fit } => self.show_routes(fit),
                 directions::Action::SavePace(pace) => self.save_walking_pace(pace),
+                directions::Action::OptionsLater(generation) => {
+                    tasks.push(cosmic::task::future(async move {
+                        tokio::time::sleep(directions::OPTIONS_DELAY).await;
+                        Message::Directions(directions::Message::OptionsSettled(generation))
+                    }));
+                }
             }
         }
         Task::batch(tasks)
